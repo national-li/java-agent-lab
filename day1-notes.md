@@ -228,7 +228,31 @@ git config --global user.email "53072364+national-li@users.noreply.github.com"
 ### 三个必须留意的细节
 
 **① 请求 `deepseek-chat`，返回 `deepseek-flash` —— 模型名是别名**
-> W1 日志要记录**返回的 model**，不是请求的 model。否则后端切换模型时日志会撒谎，成本排查会很痛苦。
+
+`deepseek-chat` 是**稳定别名**，不是具体模型名，后端实际指向哪个模型由 DeepSeek 决定。
+
+```
+你的代码 ──"deepseek-chat"──> DeepSeek 路由 ──> deepseek-flash（实际模型）
+```
+
+**这不是 bug，是设计**：DeepSeek 升级后端模型时你的代码不用改。**但代价是"请求名 ≠ 实际名"，日志如果只记请求名就会撒谎。**
+
+**处理原则：配置里用别名，日志里记实际值。**
+
+```yaml
+# application-local.yml
+llm:
+  model: deepseek-chat        # ✅ 用别名，稳
+  # model: deepseek-flash     # ⚠️ 写死具体模型，被下线就得改代码
+```
+
+**回报里还有个 `system_fingerprint` 字段，比 model 名更细粒度**：
+
+```json
+"system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+```
+
+后端配置/参数/环境一变它就变。**也建议一起记进日志。**
 
 **② `finish_reason` 是 W2 循环的核心判断依据**
 
@@ -239,9 +263,59 @@ git config --global user.email "53072364+national-li@users.noreply.github.com"
 | `length` | 被 max_tokens 截断 | 需处理（增大上限或分段） |
 | `content_filter` | 被安全策略拦截 | 要区分处理，不能当正常回复 |
 
+> ⚠️ Day 1 只见到过 `stop`——因为**没传 `tools`，模型无工具可调**。W2 传入 `tools` 后，才会第一次亲眼看到 `tool_calls`。
+
 **③ `usage` 里有 Prompt Cache 字段 —— 成本优化素材**
 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`：相同前缀的 prompt 命中缓存时**计费大幅降低**。Agent 场景下 **system prompt + 工具 schema 固定**，天然适合走缓存。
 > 这是面试聊"成本优化"的现成素材。
+
+---
+
+### ⭐ W1 日志该记什么（照这个写）
+
+**这是 Day 1 细节推导出的结论，W1 直接照抄，也是 W6 可观测性的地基。**
+
+```java
+log.info(
+    "LLM 调用完成: traceId={}, 请求model={}, 实际model={}, fingerprint={}, " +
+    "promptTokens={}, completionTokens={}, totalTokens={}, cacheHit={}, cacheMiss={}, finishReason={}, 耗时={}ms",
+    MDC.get("traceId"),                                    // W1 的链路追踪
+    req.getModel(),                                        // deepseek-chat（别名）
+    resp.getModel(),                                       // deepseek-flash（实际）← 关键
+    resp.getSystemFingerprint(),                           // 后端配置指纹
+    usage.getPromptTokens(),
+    usage.getCompletionTokens(),
+    usage.getTotalTokens(),
+    usage.getPromptCacheHitTokens(),                       // 成本优化依据
+    usage.getPromptCacheMissTokens(),
+    choice.getFinishReason(),                              // W2 的循环出口判断
+    costMs
+);
+```
+
+**字段清单与用途对照**：
+
+| 字段 | 为什么要记 |
+|---|---|
+| `traceId` | W1 验收项：每次调用都能搜到完整记录；W6 的全链路追踪 |
+| 请求 model + **实际 model** | 别名为漂移时能发现；成本按实际模型算 |
+| `system_fingerprint` | 后端配置变更的唯一指纹，比 model 名更细 |
+| `prompt/completion/total_tokens` | 计费依据；排查上下文膨胀 |
+| `cache_hit/miss` | 成本优化效果验证 |
+| `finish_reason` | W2 循环分支判断；异常终止的定位依据 |
+| 耗时 | 性能基线；超时和重试策略的调参依据 |
+
+**❌ 两个常见错误**：
+```java
+// 错误1：只记请求的 model → 后端换模型时你不知道
+log.info("model={}", req.getModel());
+
+// 错误2：把 api-key 或完整 prompt 打进日志 → 泄露密钥、日志爆炸
+log.info("调用: key={}, prompt={}", apiKey, fullPrompt);
+```
+> 第二条要记住：**日志记摘要，不记原文**。W6 的"记录输入输出摘要"就是这个意思。
+
+---
 
 ### 非流式 vs 流式（W1 要实现的差异）
 
