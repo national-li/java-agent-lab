@@ -1,0 +1,57 @@
+# ============================================================
+# 本地开发配置 —— Spring Boot 用
+# ⚠️ 此文件已在 .gitignore 中排除，绝不提交
+#
+# 启动方式（Profile: local）：
+#   java -jar app.jar --spring.profiles.active=local
+#   或 IDE 里设置 VM options: -Dspring.profiles.active=local
+#
+# key 从环境变量读取，不写死在这里：
+#   [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "sk-xxx", "User")
+# ============================================================
+
+# ---------- LLM API ----------
+llm:
+  # ${环境变量名:默认值} —— 读不到环境变量时用默认值（空）
+  api-key: ${DEEPSEEK_API_KEY:在这里填你的key}
+  base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+  model: deepseek-chat
+
+  # W1 的健壮性配置：超时 / 重试
+  timeout:
+    connect: 10s        # 建立连接超时
+    read: 60s           # 读取响应超时（流式输出要留足）
+  retry:
+    max-attempts: 3     # 最多重试 3 次
+    backoff-initial: 1s # 指数退避初始间隔
+    backoff-multiplier: 2  # 退避倍数：1s → 2s → 4s
+
+# ---------- 数据库（W4 的 RAG / 长期记忆要用）----------
+spring:
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:agentdb}
+    username: ${POSTGRES_USER:agent}
+    password: ${POSTGRES_PASSWORD:agent123}
+    driver-class-name: org.postgresql.Driver
+
+  # ---------- Redis（W1 的会话历史 / W6 的限流要用）----------
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:redis123}
+      timeout: 3s
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 2
+
+# ---------- 日志 ----------
+logging:
+  level:
+    root: INFO
+    com.example.agent: DEBUG
+  pattern:
+    # %X{traceId} 输出 MDC 里的 traceId —— W1 的链路追踪靠这个
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level [%X{traceId:-}] %logger{36} - %msg%n"
