@@ -1,0 +1,61 @@
+# Java Agent 项目本地依赖编排
+# 用途：预备周 / W1 / W4 起 Postgres(PgVector) + Redis
+# 启动：docker compose up -d
+# 停止：docker compose down
+# 停止并清空数据：docker compose down -v   ← 注意会删库
+
+services:
+  # ------------------------------------------------------------------
+  # PostgreSQL 16 + pgvector 扩展（W4 的 RAG / 长期记忆要用）
+  # 官方 pgvector 镜像已内置 vector 扩展，不需要额外编译
+  # ------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agentdb          # 库名
+      POSTGRES_USER: agent          # 用户名
+      POSTGRES_PASSWORD: agent123   # 密码（本地开发用，别上生产）
+      # 中文排序/编码，避免后面存中文乱码
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"                 # 宿主机端口:容器端口
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # 首次启动自动执行初始化脚本，建好 vector 扩展
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agentdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ------------------------------------------------------------------
+  # Redis 7（W1 的会话历史 / W6 的限流要用）
+  # ------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: agent-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass redis123
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis123", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  redisdata:
