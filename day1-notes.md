@@ -153,7 +153,7 @@ curl.exe -s --ssl-no-revoke https://api.deepseek.com/chat/completions `
 
 ---
 
-### 坑 8：`git push` 报 `schannel: failed to receive handshake, SSL/TLS connection failed`
+### 坑 7：`git push` 报 `schannel: failed to receive handshake, SSL/TLS connection failed`
 
 **现象**：Git 直连报 `Failed to connect to github.com:443`，配了代理后变成 `schannel: failed to receive handshake`。
 
@@ -175,7 +175,7 @@ Get-Process | Where-Object { $_.Name -match 'clash|verge|mihomo|v2ray|singbox' }
 
 ---
 
-### 坑 9：`GH007: Your push would publish a private email address`
+### 坑 8：`GH007: Your push would publish a private email address`
 
 **现象**：认证通过、对象传输成功，但被服务端拒绝：
 ```
@@ -343,7 +343,192 @@ curl.exe -s --ssl-no-revoke https://api.deepseek.com/chat/completions `
 
 - [ ] 今天各环节实际耗时记录（用于校准后面 8 周的时间预估）
 - [ ] 哪一步最卡、卡了多久
-- [ ] 自己对"Agent = LLM + 状态保存 + 循环"的理解（读完综述后补）
+- [ ] 自己对"Agent = LLM + 状态保存 + 循环"的理解（读完综述后补）→ **模板见下方第七节**
+
+---
+
+## 七、综述阅读笔记（9/14 读完后填）
+
+### 7.1 我对 Agent 的理解（200 字，用自己的话）
+
+> ⚠️ 不许抄原文。写不出来就说明还没读懂，回去重读。
+
+```
+Agent = LLM + 状态保存 + 循环。
+
+- LLM 负责：______________________________________________
+- 状态保存（messages 数组）负责：__________________________
+- 循环负责：______________________________________________
+
+其中"决定要不要调用工具"这一步，对应 API 返回里的
+finish_reason 字段：值为 ________ 表示继续调工具，
+值为 ________ 表示结束循环。
+
+举例（必须写具体例子，这是检验是否真懂的关键）：
+用户问："现在几点？顺便算一下 3+5 等于多少"
+Agent 会这样跑：
+  第 1 轮：______________________________________________
+  第 2 轮：______________________________________________
+  第 3 轮：______________________________________________
+  结束：________________________________________________
+```
+
+### 7.2 ReAct 的核心
+
+| 概念 | 我的理解 |
+|---|---|
+| Thought（思考） | |
+| Action（行动） | |
+| Observation（观察） | |
+| 三者如何循环 | |
+| thought 是模型天生就有的吗？ | （提示：路线图 W3 说"thought 只是 prompt 诱导出来的"） |
+
+### 7.3 ReAct vs Plan-and-Execute 对比表
+
+| | ReAct | Plan-and-Execute |
+|---|---|---|
+| 核心思路 | | |
+| 什么时候用 | | |
+| 优点 | | |
+| 缺点/风险 | | |
+| 对应我见过的 API 字段 | `finish_reason` 循环 | （W5 才实现） |
+
+### 7.4 读完后的问题清单（有疑问就记下来，W1/W2 时验证）
+
+```
+1.
+2.
+3.
+```
+
+### 7.5 参考资料（9/14 收藏）
+
+**ReAct**
+- ✅ **[已读] https://cloud.tencent.cn/developer/article/2608465** （腾讯云·一文搞懂 ReAct）
+  - 读完时间：2026-09-14
+  - 状态：**读完但未完全理解** → 已用 7.6 节的"最小白版解释"重新梳理
+  - 复盘：该文偏宏观范式介绍，术语密度高（Thought/Action/Observation、Reason-Act-Observe、Reflexion…），**缺少一个贯穿始终的具体例子**，所以读起来"每个字都认识、连起来不知道在干嘛"
+- ⬜ https://qianfan.cloud.baidu.com/qianfandev/topic/362097 （百度千帆·深入浅出 AI Agent）
+- ⬜ https://zhuanlan.zhihu.com/p/1991816580384957616 （知乎·ReAct 核心原理与架构）
+
+**Plan-and-Execute**
+- ⬜ https://developer.aliyun.com/article/1759637 （阿里云·详解三种范式，含对比）★推荐
+- ⬜ https://developer.aliyun.com/article/1755494 （阿里云·Agent 编排的三种方式）
+- ⬜ https://github.com/a2htray/a2htray.github.io/blob/main/content/post/learn-agents/02_Plan_and_Execute_agent.md
+
+**暂时别看（会带偏）**
+- 面试八股文类 → 留到 W8
+- LangChain / LangGraph 实战教程 → 留到 W3/W5
+- 英文原论文 → 路线图明确说不必精读
+
+---
+
+### 7.6 ReAct 最小白版解释（第一遍没读懂时的正确打开方式）
+
+> 文章看不懂**不是你的问题**——是它们习惯从"范式""架构"这种抽象层切入，而人理解新东西必须**从具体例子开始**。
+
+#### 一、先忘掉所有术语，只看一句话
+
+**ReAct = 让 LLM 能"动手"，而不只是"动嘴"。**
+
+- **普通 LLM 调用**：你问 → 它答（只能靠训练时的记忆，**无法获取实时信息、无法精确计算**）
+- **ReAct**：你问 → 它答"我要先查一下" → **你的代码真的去查** → 把结果告诉它 → 它再说下一步
+
+**核心洞察：模型本身什么也做不了。所有"行动"都是你的 Java 代码替它执行的。**
+
+#### 二、一个贯穿全程的例子（记住这个就懂了）
+
+**用户问：现在几点了？顺便算一下 3+5**
+
+| 轮次 | 模型说什么 | 你的代码干什么 |
+|---|---|---|
+| **第 1 轮** | "我需要知道当前时间，**调用 get_current_time**" | 收到 `finish_reason: "tool_calls"` → **执行** `get_current_time()` → 拿到 `14:30` |
+| | | 把 `role:"tool", content:"14:30"` **追加进 messages** |
+| **第 2 轮** | "我需要算 3+5，**调用 calculator，参数 3+5**" | 收到 `tool_calls` → **执行** `calculator("3+5")` → 拿到 `8` |
+| | | 把结果**追加进 messages** |
+| **第 3 轮** | "现在是 14:30，3+5=8" | 收到 `finish_reason: "stop"` → **结束循环，返回答案** |
+
+**看懂这张表，你就懂 ReAct 了。** 就这么简单。
+
+#### 三、Thought / Action / Observation 到底对应什么
+
+文章里那些术语，其实就是上面那张表的三个列：
+
+| 术语 | 实际是什么 | 在你昨天的 API 里 |
+|---|---|---|
+| **Thought**（思考） | 模型输出的"我要干什么"的文字 | `message.content`（可以是空的，也可以是一句话） |
+| **Action**（行动） | 模型说"调用哪个工具、什么参数" | `message.tool_calls[]` 里的 `name` + `arguments` |
+| **Observation**（观察） | **你的代码执行工具后拿到的结果** | 你追加进去的 `role:"tool"` 的那条消息 |
+
+> ⚠️ **关键：Observation 不是模型产生的，是你的代码产生的。** 很多文章不讲清这点，导致读者以为"模型自己在观察"。
+
+#### 四、循环是谁在转？—— **是你的 Java 代码，不是模型**
+
+这是**最容易误解**的一点：
+
+```
+❌ 错误理解：模型自己循环，自己调用工具，自己判断结束
+✅ 正确理解：模型只负责"说下一步干什么"，循环由你的 for 循环驱动
+```
+
+```java
+// W2 你要写的代码，本质就是这个
+for (int i = 1; i <= maxRound; i++) {          // ← 循环是你的代码
+    response = callLLM(messages, tools);       // ← 模型只负责"说"
+    if (response.finishReason == "stop") {
+        return response.content;               // ← 判断结束也是你的代码
+    }
+    if (response.finishReason == "tool_calls") {
+        result = executeTool(response.toolCalls);   // ← 执行也是你的代码
+        messages.add(toolMessage(result));          // ← 状态累积也是你的代码
+    }
+}
+return "我无法继续完成请求";                     // ← 防死循环也是你的代码
+```
+
+**模型是无状态的**：每次调用你都要把**完整历史**（messages）传给它。它不知道上一轮发生了什么，**是 messages 让它"看起来记得"**。
+
+#### 五、那 "Re" 和 "Act" 分别是什么
+
+```
+Re  = Reasoning（推理）  → Thought，模型说"我打算怎么办"
+Act = Acting（行动）     → Action + Observation，真的去执行并看到结果
+```
+
+**ReAct 的精髓**：**让推理和行动交替进行**——想一步、做一步、看一眼结果、再想下一步。
+
+对比一下另外两种：
+
+| 范式 | 说明 | 缺点 |
+|---|---|---|
+| **纯推理**（只 Re 不 Act） | 模型凭记忆直接答 | 会瞎编（幻觉），**算不对 3+5，不知道现在几点** |
+| **纯行动**（只 Act 不 Re） | 死板地按固定流程调工具 | 不会应变 |
+| **ReAct** | **边想边做，根据结果调整** | 可能绕远路、可能不收敛（所以要 `maxRound`） |
+
+#### 六、术语对照表（读完文章回来对号入座）
+
+| 文章里的说法 | 大白话 |
+|---|---|
+| ReAct 范式 | "让模型边想边做"的套路 |
+| Thought | 模型说"我打算……" |
+| Action | 模型说"调用 xxx 工具" |
+| Observation | 你的代码执行完，把结果告诉它 |
+| Reason-Act-Observe 循环 | Thought → Action → Observation，转圈 |
+| Agent 编排 | 谁来决定下一步（你的代码 or 框架） |
+| 工具调用（Tool Calling） | 模型输出一个"我要调工具"的结构，**不是它真的调了** |
+| 无状态 | 模型不记得上一轮，全靠你传 messages |
+
+#### 七、复查清单：现在能答上这几个问题就算懂了
+
+- [ ] 模型能自己调用工具吗？（答：**不能**，它只能说"我要调"，执行是你的代码）
+- [ ] 循环是谁在转？（答：**你的代码**，不是模型）
+- [ ] 模型怎么知道上一轮发生了什么？（答：**你传的 messages**，它本身无状态）
+- [ ] 什么时候结束循环？（答：`finish_reason == "stop"`）
+- [ ] 为什么要有 `maxRound`？（答：模型可能反复调工具**不收敛**，防死循环）
+- [ ] Thought 是模型天生就有的吗？（答：**不是**，是 prompt 诱导它写出来的，W3 会验证）
+- [ ] ReAct 相比"直接答"好在哪？（答：能拿**实时信息**、能做**精确计算**，减少幻觉）
+
+**七个都能答上来 → 可以进 W1 了。答不上来的回去看第二节那张表。**
 
 ---
 
