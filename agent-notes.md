@@ -16,7 +16,10 @@
 - [§5 通用排查方法论](#5-通用排查方法论)
 - [§6 ReAct 最小白版解释](#6-react-最小白版解释)
 - [§7 问答详解 Q1–Q11](#7-问答详解q1q11)
-- [§8 速查命令](#8-速查命令)
+- [§8 Function Calling 完整规范](#8-function-calling-完整规范)
+- [§9 工具数量与企业级扩展](#9-工具数量与企业级扩展)
+- [§10 Plan-and-Execute 与选型判据](#10-plan-and-execute-与选型判据)
+- [§11 速查命令](#11-速查命令)
 
 ---
 
@@ -872,7 +875,554 @@ data: [DONE]
 
 ---
 
-## §8 速查命令
+## §8 Function Calling 完整规范
+
+> 来源：DeepSeek 文档站路径改版频繁（原 `/guides/function_calling` 已 404），此节为完整自包含说明。
+> 格式与 OpenAI 基本一致，是 W2 定义 `Tool` 接口时的对照标准。
+
+### 8.1 核心认知
+
+**模型不执行任何东西。** 它只输出一段**结构化文字**说明"我想调用某个工具、用这些参数"，**真正的执行是你的代码干的**。
+
+### 8.2 请求：你告诉模型有哪些工具
+
+```json
+POST https://api.deepseek.com/chat/completions
+Headers: Authorization: Bearer sk-xxx
+         Content-Type: application/json
+
+{
+  "model": "deepseek-chat",
+  "messages": [ { "role": "user", "content": "现在几点了？" } ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_current_time",
+        "description": "获取当前的日期和时间。当用户询问现在几点、今天几号时调用。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "timezone": { "type": "string", "description": "时区，如 Asia/Shanghai" }
+          },
+          "required": []
+        }
+      }
+    }
+  ],
+  "stream": false
+}
+```
+
+**`tools` 数组每项形状固定**：
+```
+{
+  "type": "function",        ← 固定，"这个 tool 是函数型"
+  "function": {
+    "name":        字符串，自己起
+    "description": 字符串，告诉模型【什么时候该用它】 ← ⚠️ 极其重要
+    "parameters":  JSON Schema，描述参数结构
+  }
+}
+```
+
+### 8.3 多个 function 的格式 ⚠️ 三个易错点
+
+```json
+"tools": [
+  { "type": "function", "function": { "name": "get_current_time", "description": "...", "parameters": {...} } },
+  { "type": "function", "function": { "name": "calculator",        "description": "...", "parameters": {...} } },
+  { "type": "function", "function": { "name": "web_search",        "description": "...", "parameters": {...} } }
+]
+```
+
+| 易错点 | 说明 |
+|---|---|
+| **① 数组元素没有顶层 `name`** | 名字在 `function.name` 里，**必须嵌套一层**（复制粘贴时最容易漏） |
+| **② 逗号位置** | 元素之间要有逗号，**最后一个不能有**（JSON 不允许尾随逗号，报 400） |
+| **③ `"type": "function"` 每个元素都要写** | **不是**只在数组外面写一次 |
+
+**推荐用代码生成，别手写 JSON**：
+```java
+ArrayNode tools = objectMapper.createArrayNode();
+for (Tool tool : toolRegistry.values()) {
+    tools.add(wrapAsFunctionSchema(tool));   // 统一包成 {type, function:{...}}
+}
+requestNode.set("tools", tools);
+```
+> 好处：**新增工具时零改动** —— 实现 `Tool` 接口并注册进去，`tools` 数组自动包含它。
+
+### 8.4 响应：三种情况（+ 一种异常）
+
+#### 情况 1：要调工具 → `finish_reason: "tool_calls"`
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,                    ← ⚠️ 是 null
+      "tool_calls": [
+        { "id": "call_00_abc123",         ← ⚠️ 必须记住这个 id
+          "type": "function",
+          "function": {
+            "name": "get_current_time",
+            "arguments": "{\"timezone\":\"Asia/Shanghai\"}"   ← ⚠️ 字符串不是对象
+          } }
+      ]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+| 点 | 说明 |
+|---|---|
+| `content` 是 `null` | 调工具时模型不说话 → **不判空直接 NPE** |
+| `tool_calls` 是**数组** | ⚠️ **可能一次返回多个**（并行调用） |
+| `id` | 回传结果时必须带上，**用来对应** |
+| `arguments` 是**字符串** | 要 `objectMapper.readTree(...)` 解析 |
+
+#### 情况 2：直接回答 → `finish_reason: "stop"`
+```json
+"message": { "role": "assistant", "content": "现在是 2026 年 9 月 15 日...", "tool_calls": null }
+```
+→ **这就是最终答案，结束循环。**
+
+#### 情况 3：两个都有（较少见但存在）
+```json
+"message": { "content": "我来查一下当前时间。", "tool_calls": [ ... ] }
+```
+⚠️ **别写成 `if (content != null) return content;`** —— 那样会**把工具调用漏掉**。
+> **判断依据永远是 `tool_calls` 是否非空，不是 `content` 是否非空。**
+
+#### 情况 4：两个都空（异常）
+→ 有限重试。详见 §7 Q8。
+
+### 8.5 回传结果：用 `role: "tool"`
+
+**发第二次请求**，把执行结果告诉模型：
+
+```json
+{
+  "model": "deepseek-chat",
+  "messages": [
+    { "role": "user", "content": "现在几点了？" },
+
+    { "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        { "id": "call_00_abc123",
+          "type": "function",
+          "function": { "name": "get_current_time", "arguments": "{\"timezone\":\"Asia/Shanghai\"}" } }
+      ] },
+
+    { "role": "tool",                                  ← 新增的第 4 种角色
+      "tool_call_id": "call_00_abc123",                ← ⚠️ 对应上面那个 id
+      "content": "2026-09-15 21:30:45" }               ← 执行结果（必须字符串）
+  ],
+  "tools": [ ...同样的工具列表... ]                     ← ⚠️ 要再传一次
+}
+```
+
+| 点 | 说明 |
+|---|---|
+| **`tool_call_id`** | **必须对应** `tool_calls[i].id` —— 多个工具时一一配对 |
+| **`content` 必须是字符串** | 结果是对象也要 `stringify` |
+| **`tools` 要再传** | 模型无状态，不传它就不知道还有工具可用 |
+| **⚠️ `messages` 必须完整** | user → assistant → tool **三条一条都不能少**。只传 tool 那条，模型不知道"是谁请求的" → 报错或行为异常 |
+
+### 8.6 完整循环骨架（W2 要写的）
+
+```java
+List<Message> messages = new ArrayList<>();
+messages.add(userMessage("现在几点了？"));
+
+for (int i = 1; i <= maxRound; i++) {
+    Response resp = callLLM(messages, tools);       // 每次都传完整历史 + 全量工具
+
+    // ⭐ 判断依据是 toolCalls，不是 content！
+    if (resp.toolCalls != null && !resp.toolCalls.isEmpty()) {
+
+        messages.add(resp.toAssistantMessage());    // ⚠️ 先把这条 assistant 加进历史
+
+        for (ToolCall tc : resp.toolCalls) {        // 可能多个（并行）
+            String result = validateAndExecute(tc); // 校验 + 执行（见 §7 Q10）
+            messages.add(toolMessage(tc.id(), result));
+        }
+        continue;
+
+    } else if (resp.content != null && !resp.content.isBlank()) {
+        return resp.content;                        // 最终答案
+    } else {
+        // 两个都空 → 有限重试（见 §7 Q8）
+    }
+}
+return "达到最大轮次，已终止";
+```
+
+**两处最容易写错**：
+| 错误 | 后果 |
+|---|---|
+| 忘了把 assistant 那条加进 messages | 下轮缺少"谁请求了工具"，模型困惑 |
+| 用 `content != null` 判断结束 | 漏掉工具调用（情况 3）或 NPE（情况 1） |
+
+### 8.7 完整往返示例（含并行调用）
+
+**第 1 次请求**
+```json
+{ "messages": [{"role":"user","content":"现在几点？顺便算 3+5"}],
+  "tools": [get_current_time, calculator] }
+```
+
+**第 1 次响应** —— ⭐ 注意**一次返回了 2 个工具调用**
+```json
+{ "choices": [{
+    "message": { "role": "assistant", "content": null,
+      "tool_calls": [
+        { "id": "call_1", "type": "function",
+          "function": { "name": "get_current_time", "arguments": "{}" } },
+        { "id": "call_2", "type": "function",
+          "function": { "name": "calculator", "arguments": "{\"expression\":\"3+5\"}" } }
+      ] },
+    "finish_reason": "tool_calls" }] }
+```
+> 这就是"**1 轮里可以多个工具调用**"（§7 Q2）。
+
+**第 2 次请求**
+```json
+{ "messages": [
+    {"role":"user","content":"现在几点？顺便算 3+5"},
+    {"role":"assistant","content":null,"tool_calls":[call_1, call_2]},
+    {"role":"tool","tool_call_id":"call_1","content":"2026-09-15 21:30:45"},
+    {"role":"tool","tool_call_id":"call_2","content":"8"}
+  ],
+  "tools": [...] }
+```
+
+**第 2 次响应**
+```json
+{ "choices": [{ "message": { "role": "assistant",
+      "content": "现在是 2026 年 9 月 15 日 21:30，3+5 等于 8。", "tool_calls": null },
+    "finish_reason": "stop" }] }
+```
+→ **`stop` → 结束循环。总共 2 轮。**
+
+### 8.8 实战要点
+
+| 要点 | 说明 |
+|---|---|
+| **`description` 是 prompt** | 说清"**什么时候**用它"比"它能干什么"更重要 |
+| **工具名不能重复** | 同一请求里重名会冲突 |
+| **`arguments` 可能不是合法 JSON** | try-catch，**失败时把错误塞回 messages**（自我纠错） |
+| **模型会幻觉出不存在的工具名** | 必须校验 `toolRegistry.get(name) != null` |
+| **并行调用按 `id` 配对** | 多工具时不能靠顺序假设 |
+| **结果大小要控制** | 工具返回 10MB 塞进 messages → 下轮 token 爆炸 |
+
+---
+
+## §9 工具数量与企业级扩展
+
+> 来源：对"3-4 个工具足够"的质疑（2026-09-15）
+
+### 9.1 先纠正：「3-4 个」是学习阶段的建议，不是技术上限
+
+路线图原文语境（W3）：
+> ❌ 避坑：不要沉迷堆一堆花里胡哨工具！**3-4 个工具足够。重点是理解编排逻辑，不是工具多寡。**
+
+**它在说**：学习阶段别把时间花在堆工具上，**重点在理解循环怎么转**。
+**它没说**："生产环境也只用 3-4 个。"
+
+### 9.2 但「工具不能太多」这个约束是真的 —— 机制在这
+
+**核心洞察**：瓶颈不是"工具总数"，而是 **"单次决策里有多少候选在互相竞争"**。
+
+**① 工具选择本质是分类问题，而工具多了必然扎堆**
+```json
+{ "name": "get_user",         "description": "查询用户信息" }
+{ "name": "get_user_profile", "description": "查询用户资料" }
+{ "name": "get_user_detail",  "description": "查询用户详情" }
+```
+**这三者在语义上几乎无法区分** —— 模型不是"选不对"，是**人类也选不对**。
+
+**② 负面干扰（negative interference）**
+模型看到"还有别的工具可用"，**会改变选择倾向** —— 准确率下降不是 token 变多导致的，是**上下文干扰项变多**。
+
+**③ 每轮都是独立的选错机会**
+```
+3 个工具  → 选错概率 ×3
+20 个工具 → 选错概率 ×20
+```
+Agent 跑 5 轮，**错误概率会累积**。
+
+**④ 中文 description 区分度更低** —— 训练数据里中文 tool schema 比英文少。
+
+### 9.3 企业级怎么做 —— 六种解法
+
+**核心原则：不是"少用工具"，而是"减少单次决策的候选数"。**
+
+#### 方案 1：分层 / 两阶段选择（最主流）
+```
+第 1 步：模型只选【类别】       ← 候选 5-8 个，准确率高
+         "我要用订单相关的能力"
+                ↓
+第 2 步：系统注入该类别的工具    ← 候选 3-4 个
+         "可选：query_order / refund_order / cancel_order"
+                ↓
+第 3 步：模型选具体工具并给参数
+```
+**模型每次只面对 3-4 个候选，但系统总共可以有几百个工具。**
+> 类比：不会把整个图书馆的书名给模型看，先给"分类目录"。
+
+#### 方案 2：动态注入 / 按意图路由
+```java
+String intent = classifyIntent(userQuery);              // 便宜的分类器，甚至规则
+List<Tool> relevant = toolRegistry.byCategory(intent);  // 只注入 3-5 个
+callLLM(messages, relevant);
+```
+**意图分类的成本远低于一次 LLM 调用**，却能显著提升准确率。
+
+#### 方案 3：工具本身"更通用"（减少工具数量的正解）
+```
+❌ 20 个细粒度工具：
+   get_user_by_id / get_user_by_phone / get_user_by_email
+   create_order / update_order / cancel_order / refund_order ...
+
+✅ 3 个通用工具：
+   sql_query(sql)              ← 一个顶 20 个 CRUD
+   http_request(url, method)   ← 通用 HTTP
+   run_code(language, code)    ← 通用计算
+```
+**不发布业务工具，发布"能力原语"** —— 组合式而非枚举式。
+> 💡 **Claude Code / Cursor 就是这种设计**：工具很少（读文件/写文件/跑命令/搜索），但能力覆盖极广。
+
+#### 方案 4：工具搜索 / 渐进式披露（MCP 的模式）
+```json
+{ "name": "search_tools",
+  "description": "当你不确定有什么工具可用时，用关键词搜索工具库" }
+```
+```
+模型：不确定怎么查订单 → 调用 search_tools("订单 查询")
+系统：返回匹配的 3 个工具定义
+模型：好，调用 query_order(...)
+```
+**模型按需获取工具定义，而不是一次全给。** MCP 生态大量采用（因为服务器可能暴露上百个工具）。
+
+#### 方案 5：多 Agent 拆分（W5 的 LangGraph 场景）
+```
+主 Agent（编排）
+   ├─ 订单 Agent     ── 带 4 个订单工具
+   ├─ 库存 Agent     ── 带 3 个库存工具
+   └─ 数据分析 Agent ── 带 3 个查询工具
+```
+**每个子 Agent 只面对自己的 3-5 个工具，总能力不受限。**
+> 这正是 W5 学 LangGraph 的原因之一 —— 通用状态机能编排多 Agent。
+
+#### 方案 6：服务端路由（模型只调 1 个工具）
+```json
+{ "name": "order_service",
+  "description": "订单服务统一入口。参数 action 指定动作",
+  "parameters": {
+    "action": { "type": "string", "enum": ["query","create","cancel","refund"] },
+    "payload": { "type": "object" } } }
+```
+**模型只看到 1 个工具**，具体操作由你的代码按 `action` 分发。
+**代价**：模型对细节控制力下降（`payload` 自由对象容易填错），适合高度模式化的场景。
+
+### 9.4 正确的认知框架
+
+| 说法 | 对不对 |
+|---|---|
+| "3-4 个工具足够" | ⚠️ **学习阶段建议**，不是普适规律 |
+| "工具总数不能超过 10" | ❌ 错 —— **企业级几百个工具很正常** |
+| **"单次决策的候选数要控制在 3-7 个"** | ✅ **这才是真实约束** |
+| "工具多了会选错" | ✅ 对，但**是"一次给太多"导致的**，不是"总数多" |
+| "工具要设计得更通用" | ✅ 对 —— **能显著减少候选数** |
+
+> **一句话：限制的不是"你有多少工具"，而是"模型在一次决策里要面对多少个候选"。**
+
+### 9.5 面试答法 ⭐
+
+**被问"企业级 Agent 工具很多怎么办"**：
+
+> "工具数量本身不是问题，**问题是单次决策的候选数**。模型选工具本质是个分类任务，候选多了会因语义相近和负面干扰而退化。
+>
+> 生产上我见过几种做法：
+> 1. **分层选择** —— 模型先选类别，系统再注入该类的 3-5 个工具，总库可以几百个
+> 2. **按意图动态注入** —— 便宜的意图分类器先路由，只给相关工具
+> 3. **工具设计得更通用** —— 用 `sql_query` 替代 20 个 CRUD，Claude Code 就是这种组合式设计
+> 4. **工具搜索 / 渐进披露** —— 给模型一个 `search_tools`，MCP 生态常用
+> 5. **多 Agent 拆分** —— 每个子 Agent 只带自己那组工具
+>
+> token 成本可以用 Prompt Cache 缓解，但**准确率下降是消不掉的**，所以核心是**控制候选数而不是控制总数**。"
+
+### 9.6 回到路线图：为什么让你只做 3-4 个
+
+```
+W2 的核心是：for 循环 + finish_reason 判断 + 状态累积
+             ← 这些跟工具有几个完全无关
+```
+
+| 3-4 个工具的好处 | 说明 |
+|---|---|
+| 调试快 | 出错时容易判断是循环逻辑问题还是工具选择问题 |
+| 日志清爽 | 每轮日志不爆炸 |
+| 覆盖核心场景 | 本地工具（时间/计算）+ 外部 API（搜索）+ RAG 检索，足够演示全部机制 |
+
+**你要练的是"控制循环"，不是"管理工具库"。**
+
+---
+
+## §10 Plan-and-Execute 与选型判据
+
+> 来源：2026-09-15 读完综述后的对话验收。**W5（10/16）动手时对照本节。**
+
+### 10.1 两者本质区别
+
+| | **ReAct** | **Plan-and-Execute** |
+|---|---|---|
+| 控制方式 | **交织（interleaved）**：想一步、做一步 | **plan-then-execute**：先出完整计划，再逐条执行 |
+| 每步依赖 | **每步都依赖上一步的 Observation** ← "动态"的来源 | **执行阶段默认不回头改计划** ← "刚性"的来源 |
+| 谁控制流程 | **模型**每步参与决策 | ⭐ **代码**遍历计划列表 |
+| LLM 参与度 | 每一步 | 规划阶段 + 单步内部 |
+
+⚠️ **关键澄清**：Plan-and-Execute 的执行阶段**仍然可以调工具、仍然有 Observation**。
+**两者区别不是"有没有工具调用"，而是"有没有事先定好的完整计划"。**
+
+### 10.2 ⭐ 为什么执行器是「你的 Java 代码」
+
+> W5 路线图原文："你的 **Java 代码**逐条执行计划里的任务"
+
+**控制流对比**：
+```
+【ReAct / W2】
+  模型说下一步 → 代码执行 → 模型再说下一步
+  → 模型在【每一步】都参与决策
+
+【Plan-and-Execute / W5】
+  ① 规划阶段：LLM 生成 ["步骤1","步骤2","步骤3"]     ← LLM 参与
+  ② 执行阶段：代码 for 循环遍历列表                   ← ⭐ 代码控制流程
+              每一步内部才调 LLM / 工具                ← LLM 只负责单步
+```
+
+> **类比**：
+> - **ReAct** = 每个路口都问导航"下一个路口怎么走"
+> - **Plan-and-Execute** = 导航先给你完整路线，**然后你自己一站一站开**
+
+**三个理由**：
+
+**① 可靠性 —— LLM 会"忘记"计划，代码不会**
+LLM 不可靠地遵循多步指令，可能：跳步 / 重复执行 / 顺序打乱 / **自己 invent 计划外的步骤**。
+**用代码遍历列表，顺序 100% 保证。**
+
+**② 可控性 —— 能在步骤之间插入逻辑（最重要）**
+```java
+for (Step step : plan.getSteps()) {
+    validateStep(step);                  // 前置校验（权限、参数合法性）
+    StepResult r = execute(step);
+
+    if (r.isFailed()) {
+        plan = replan(plan, step, r);    // 失败 → 重新规划
+        continue;
+    }
+
+    auditLog(step, r);                   // 每步审计（W6 可观测性）
+    persistProgress(step, r);            // 持久化进度 → 中断可恢复（W7 长任务）
+    notifyUser(step);                    // 每步实时推送（配合 W1 的 SSE）
+
+    if (needsUserConfirm(step)) break;   // 危险操作等人工确认
+}
+```
+**让 LLM 自己跑，这些都做不到** —— 你只拿到一段文本，解析出来就已经晚了。
+
+**③ 成本与确定性**
+- 单步失败只重试那一步，不用重跑整个计划
+- 进度存库 → 可中断恢复（W7 的长任务设计）
+- 执行阶段不用每步都问"下一步干什么"，token 更省
+
+### 10.3 ⚠️ 纠错场景的关键认知：规划 ≠ 预演
+
+**常见误解**：
+> ❌ "Plan-and-Execute 会在**规划阶段**就发现数据源没权限，提前告知"
+
+**这做不到。** 因为：
+```
+规划阶段：LLM 只是【生成一份步骤文本】
+          ["1. 连接数据源", "2. 拉取数据", "3. 分析", "4. 出报告"]
+          ↑ 它【不执行】任何东西 → 【不可能知道】有没有权限
+```
+**权限问题只有"真的去连一次"才会暴露** —— 那已经是执行阶段了。
+
+**真正的区别是「纠错成本与时机」**：
+
+| | **ReAct** | **Plan-and-Execute** |
+|---|---|---|
+| 发现问题时 | 第 1 步就撞上（立刻就去连了） | **第 3 步**才撞上（前两步白跑） |
+| 怎么应对 | **天然灵活** —— "那我换个数据源" | **计划刚性** —— 要重新规划 |
+| 开销 | 试错消耗 token | **已完成步骤的成本沉没** |
+| 用户体验 | 能看到"边试边调整" | 等半天，最后说"做不了" |
+
+**那"提前发现"能不能实现？能 —— 靠代码预检，不是靠 LLM**：
+```java
+// 生成计划后、执行前，做一次轻量预检（真实探测，不是 LLM 推理）
+for (Step step : plan.getSteps()) {
+    if (!precheck(step)) {          // 权限校验、资源存在性检查
+        replan();
+    }
+}
+```
+
+### 10.4 ⭐ 选型判据（最硬的一条）
+
+> **"能不能在开始前写出一份像样的计划？"**
+> - **能 → Plan-and-Execute**
+> - **不能（目标/环境不明）→ 只能 ReAct**
+
+**三个场景对照**：
+
+| 场景 | 选型 | 真正的理由 |
+|---|---|---|
+| A. 查天气 | **ReAct** | 目标明确的单步任务，**规划开销纯属浪费**（多一次 LLM 调用 + 多一轮延迟） |
+| B. 50 页 PDF 总结 + 发邮件 | **Plan-and-Execute** | ① 步骤天然有序（解析→分块→总结→拼装→发送）② 多步耗时，用户需要知道"要多久、到哪了" ③ 步骤强依赖，计划确定性有价值 ④ 失败点明确，可精确重试那一步 |
+| C. 客服（用户随便说一句） | **ReAct** | ⭐ **意图未知 → 根本无法规划**。"我那个订单好像有问题"连"步骤1"都写不出来。ReAct 可以先澄清再决定动作 |
+
+### 10.5 固有缺点（五个，按严重程度排序）
+
+| # | 缺点 | 为什么是缺点 |
+|---|---|---|
+| **1** | **计划刚性** ⭐ | 计划一旦生成，**遇意外只能推倒重来**。ReAct 撞墙立刻改道，它要重新规划（丢掉已完成成果 + 又一次 LLM 调用） |
+| **2** | **规划质量决定一切** | 计划错了后面全错。**第一版计划往往不够好** —— LLM 不知道你的数据长什么样、有哪些坑 |
+| **3** | **长计划容易漂移** | 步骤一多（20+），LLM 生成的计划本身就不可靠：漏步、顺序错、粒度不均 |
+| **4** | **延迟靠前** | 用户要**等完整计划生成**才开始执行 → 首字节响应变慢（除非边规划边推流） |
+| **5** | **额外的 LLM 调用开销** | 规划本身是一次额外调用，token 和延迟都增加 |
+
+### 10.6 ⭐ 三种模式光谱（W5 要做的是中间那个）
+
+```
+纯 ReAct              ← 完全没有计划
+混合（W5 要做的）      ← 有计划，但执行中可更新    ⭐ 工业界实际采用
+纯 Plan-and-Execute    ← 计划完全固定
+```
+
+**W5 路线图原文**：
+> 每一步执行完，**可以允许 LLM 更新计划**（增加、删除步骤）
+
+**这就是对"计划刚性"的补救** —— 兼顾"有序"和"应变"。
+
+### 10.7 面试答法
+
+**被问"ReAct 和 Plan-and-Execute 怎么选"**：
+
+> "核心判据是**能不能在开始前写出一份像样的计划**。目标明确、步骤有序、多步耗时的任务用 Plan-and-Execute；目标或环境不明、需要边走边看的用 ReAct。
+>
+> 但要注意 Plan-and-Execute 有个常见误解 —— **规划阶段发现不了执行期的问题**（比如权限），因为 LLM 只是生成步骤文本，不执行任何东西。所以它的真正劣势是**纠错成本高**：计划刚性，遇意外要重新规划，已完成步骤的成本沉没。补救办法是**执行中允许更新计划**，做成混合模式，这也是工业界的实际做法。
+>
+> 另外执行阶段的控制流**应该由代码而不是 LLM 控制** —— LLM 不可靠地遵循多步指令（跳步、重复、顺序错乱），而且只有代码控制流程时才能在步骤之间插入审计日志、进度持久化、人工确认这些逻辑。"
+
+---
+
+## §11 速查命令
 
 ### PowerShell 快捷命令（profile 里已配）
 
