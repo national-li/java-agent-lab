@@ -1,57 +1,48 @@
 # ============================================================
-# 本地开发配置 —— Spring Boot 用
-# ⚠️ 此文件已在 .gitignore 中排除，绝不提交
+# 模板文件（可以提交，只放占位符）
 #
-# 启动方式（Profile: local）：
-#   java -jar app.jar --spring.profiles.active=local
-#   或 IDE 里设置 VM options: -Dspring.profiles.active=local
+# 用法：
+#   ① 复制成 src/main/resources/application-local.yml
+#   ② 填上你的真实 key
+#   ③ 激活 local profile：
+#        IDEA:   Run Configuration → Active profiles 填 local
+#        Maven:  .\mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=local
 #
-# key 从环境变量读取，不写死在这里：
-#   [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "sk-xxx", "User")
+# ⚠️ application-local.yml 已被 .gitignore 排除，真实 key 放那里才安全
+# ⚠️ 本文件带 .example 后缀，会被提交 —— 【绝对不能填真实 key】
+#
+# ------------------------------------------------------------
+# 注意分工：
+#   基础配置（数据库、Redis、超时重试、日志格式）在 application.yml
+#   本文件只放【个人差异】，不要复制 application.yml 的内容过来
+# ------------------------------------------------------------
 # ============================================================
 
-# ---------- LLM API ----------
+# ---------- 个人 API Key ----------
+# 优先级：环境变量 DEEPSEEK_API_KEY  >  冒号后的默认值
+#
+# 推荐做法：key 只放环境变量，这里保持占位符不动
+#   [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "sk-xxx", "User")
 llm:
-  # ${环境变量名:默认值} —— 读不到环境变量时用默认值（空）
   api-key: ${DEEPSEEK_API_KEY:在这里填你的key}
-  base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
-  model: deepseek-chat
 
-  # W1 的健壮性配置：超时 / 重试
-  timeout:
-    connect: 10s        # 建立连接超时
-    read: 60s           # 读取响应超时（流式输出要留足）
-  retry:
-    max-attempts: 3     # 最多重试 3 次
-    backoff-initial: 1s # 指数退避初始间隔
-    backoff-multiplier: 2  # 退避倍数：1s → 2s → 4s
-
-# ---------- 数据库（W4 的 RAG / 长期记忆要用）----------
-spring:
-  datasource:
-    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:agentdb}
-    username: ${POSTGRES_USER:agent}
-    password: ${POSTGRES_PASSWORD:agent123}
-    driver-class-name: org.postgresql.Driver
-
-  # ---------- Redis（W1 的会话历史 / W6 的限流要用）----------
-  data:
-    redis:
-      host: ${REDIS_HOST:localhost}
-      port: ${REDIS_PORT:6379}
-      password: ${REDIS_PASSWORD:redis123}
-      timeout: 3s
-      lettuce:
-        pool:
-          max-active: 8
-          max-idle: 8
-          min-idle: 2
-
-# ---------- 日志 ----------
+# ---------- 个人日志级别（本地调试用）----------
 logging:
   level:
-    root: INFO
     com.example.agent: DEBUG
-  pattern:
-    # %X{traceId} 输出 MDC 里的 traceId —— W1 的链路追踪靠这个
-    console: "%d{HH:mm:ss.SSS} [%thread] %-5level [%X{traceId:-}] %logger{36} - %msg%n"
+
+# ------------------------------------------------------------
+# 其他可选的个人覆盖（需要时取消注释）
+#
+# spring:
+#   datasource:
+#     url: jdbc:postgresql://localhost:15432/agentdb   # 端口被占用换了映射
+#   data:
+#     redis:
+#       password: 你自己的密码
+#
+# llm:
+#   model: deepseek-reasoner                           # 想试推理模型
+#   timeout:
+#     read: 120s                                       # 长任务放宽超时
+# ------------------------------------------------------------

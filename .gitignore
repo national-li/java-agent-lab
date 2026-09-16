@@ -30,28 +30,40 @@ replay_pid*
 # ---------------------------------------------------------------
 # 敏感信息 —— 最重要的一段，别删
 # ---------------------------------------------------------------
-# 本地配置：只提交 application.yml，本地敏感项放这里覆盖
-application-local.yml
-application-local.properties
-application-dev.yml
-application-prod.yml
+# ⚠️ 规则原则：精确锚定，不用宽泛通配
+#    （宽泛通配会误伤 *.example.yml 模板文件，导致别人 clone 后没有配置说明）
+#
+# 本地配置：敏感项只放这些文件，绝不提交
+**/application-local.yml
+**/application-local.properties
+**/application-dev.yml
+**/application-dev.properties
+**/application-prod.yml
+**/application-prod.properties
+**/application-secret.yml
+**/application-secret.properties
 
 # 环境变量文件
 .env
 .env.local
-*.env
+.env.dev
+.env.prod
 
-# 密钥 / 证书
+# 证书 / 密钥
 *.pem
 *.key
 *.p12
 *.jks
+*.keystore
+id_rsa*
 
-# 任何名字里带 secret / credential / apikey 的文件
-*secret*
-*credential*
-*apikey*
-*api-key*
+# ⚠️ 例外必须写在排除规则【之后】（Git 按顺序处理，后面的覆盖前面的）
+#    这些是"给人看的模板"，必须能提交，否则别人 clone 后不知道要配什么
+!**/*.example.yml
+!**/*.example.properties
+!**/*.sample.yml
+!**/*.template.yml
+!.env.example
 
 # ---------------------------------------------------------------
 # Docker 数据卷（数据在命名卷里，但防止有人挂到本地目录）
@@ -107,3 +119,14 @@ desktop.ini
 *.tmp
 *.bak
 *.orig
+
+# ---------------------------------------------------------------
+# ⚠️ 必须在最后：模板文件例外（防上方任何规则误伤）
+#    Git 按顺序处理，最后出现的规则优先级最高
+# ---------------------------------------------------------------
+!*.example.yml
+!*.example.properties
+!*.sample.yml
+!*.template.yml
+!.env.example
+

@@ -1,0 +1,68 @@
+# ============================================================
+# 基础配置 —— 提交进仓库，所有敏感值一律用【环境变量】占位
+#
+# 语法：${环境变量名:默认值}
+#       冒号前 = 环境变量名
+#       冒号后 = 读不到环境变量时用的默认值（空 = 无默认值）
+#
+# ⚠️ 本文件【不含任何真实密钥】，可以安全提交
+#    个人密钥放 application-local.yml（已被 .gitignore 排除）
+#
+# 环境变量在本机怎么配：
+#   [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "sk-xxx", "User")
+#   （PowerShell profile 已配置自动加载）
+#
+# 别人 clone 后怎么跑：
+#   ① 设好 DEEPSEEK_API_KEY 环境变量
+#   ② docker compose up -d
+#   ③ .\mvnw.cmd spring-boot:run     ← 不需要任何 profile
+# ============================================================
+
+spring:
+  application:
+    name: agent
+
+  # ---------- 数据库（W4 的 RAG / 长期记忆要用）----------
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:agentdb}
+    username: ${POSTGRES_USER:agent}
+    password: ${POSTGRES_PASSWORD:agent123}      # Docker 本地默认密码，非敏感
+    driver-class-name: org.postgresql.Driver
+
+  # ---------- Redis（W1 的会话历史 / W6 的限流要用）----------
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:redis123}        # Docker 本地默认密码，非敏感
+      timeout: 3s
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 2
+
+# ---------- LLM API ----------
+# ⚠️ api-key 默认值【故意留空】—— 真实 key 只能来自环境变量或个人 profile
+llm:
+  api-key: ${DEEPSEEK_API_KEY:}
+  base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+  model: ${DEEPSEEK_MODEL:deepseek-chat}
+
+  # W1 的健壮性配置：超时 / 重试
+  timeout:
+    connect: 10s          # 建立连接超时
+    read: 60s             # 读取响应超时（流式输出要留足）
+  retry:
+    max-attempts: 3       # 最多重试 3 次
+    backoff-initial: 1s   # 指数退避初始间隔
+    backoff-multiplier: 2 # 退避倍数：1s → 2s → 4s
+
+# ---------- 日志（W1 的 MDC 链路追踪）----------
+logging:
+  level:
+    root: INFO
+    com.example.agent: INFO   # 本地想要 DEBUG 在 application-local.yml 覆盖
+  pattern:
+    # %X{traceId:-} 输出 MDC 里的 traceId —— W1 靠这个串起整条调用链
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level [%X{traceId:-}] %logger{36} - %msg%n"
