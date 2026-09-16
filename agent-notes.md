@@ -34,8 +34,30 @@
 | WSL | 2.7.14 | `wsl --version` |
 | Ubuntu | 默认版本 2 | `wsl -l -v` |
 | Docker | 29.7.2 | `docker --version` |
-| Postgres + pgvector | pg16 / vector **0.8.6** | `dx`（见 §8） |
+| **Spring Boot** | **4.1.1**（Spring Framework 7） | `pom.xml` |
+| Postgres + pgvector | pg16 / vector **0.8.6** | `dx`（见 §11） |
 | Redis | 7-alpine | `docker exec -e REDISCLI_AUTH=redis123 -it agent-redis redis-cli ping` → `PONG` |
+
+> ⚠️ **关于 Spring Boot 4.1.1**（2026-09-16 核对）
+> - Spring AI **2.0.0 GA 要求 Spring Boot 4**，不再支持 3.x
+> - 所以 **4.1.1 与 W3 要引入的 Spring AI 2.0 正好配套**，不需要迁移 —— 这点很省事
+> - Spring Boot 4 做了**模块化拆分**：`spring-boot-starter-web` → **`spring-boot-starter-webmvc`**
+>   - 测试依赖同理：`@WebMvcTest` 等注解从 `spring-boot-starter-test` 挪到了 **`spring-boot-starter-webmvc-test`**
+> - ⚠️ **注意**：网上示例大多是 Spring Boot 3.x 的，遇到对不上的地方以[官方 4.0 迁移指南](https://github.com/spring-projects/spring-boot/wiki/Spring-Boot-4.0-Migration-Guide)为准
+
+### Maven 镜像（已配置）
+
+`.m2/settings.xml` 已配阿里云镜像，加速依赖下载：
+
+| 镜像 | 用途 |
+|---|---|
+| `aliyun-public` | 代理 central（聚合 central + jcenter） |
+| `aliyun-spring` | 代理 spring-milestones / spring-snapshots（W3 可能需要） |
+
+**验证生效**：
+```powershell
+.\mvnw.cmd help:effective-settings | Select-String "aliyun"
+```
 
 ### 连接参数（W1 写代码直接用）
 
