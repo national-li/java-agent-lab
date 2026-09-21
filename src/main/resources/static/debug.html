@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <title>Agent API 调试台</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+            max-width: 900px; margin: 40px auto; padding: 0 20px;
+            background: #f5f6f8; color: #222;
+        }
+        h1 { font-size: 20px; margin-bottom: 4px; }
+        .sub { color: #888; font-size: 13px; margin-bottom: 24px; }
+        .card {
+            background: #fff; border-radius: 8px; padding: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 16px;
+        }
+        label { display: block; font-size: 13px; color: #555; margin-bottom: 6px; font-weight: 600; }
+        input, textarea {
+            width: 100%; padding: 9px 11px; border: 1px solid #d5d8dd;
+            border-radius: 6px; font-size: 14px; font-family: inherit;
+        }
+        textarea { height: 90px; resize: vertical; }
+        input:focus, textarea:focus { outline: none; border-color: #4a7dff; }
+        .row { margin-bottom: 14px; }
+        .btns { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+        button {
+            padding: 9px 18px; border: none; border-radius: 6px;
+            font-size: 14px; cursor: pointer; font-family: inherit;
+        }
+        .primary { background: #4a7dff; color: #fff; }
+        .primary:hover { background: #3a6ae8; }
+        .ghost { background: #eef0f4; color: #444; }
+        .ghost:hover { background: #e2e5eb; }
+        button:disabled { opacity: .5; cursor: not-allowed; }
+
+        .status { display: inline-block; padding: 3px 10px; border-radius: 4px;
+                  font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+        .s-ok   { background: #e3f5e8; color: #1c7c3c; }
+        .s-warn { background: #fff4e0; color: #a86a00; }
+        .s-err  { background: #fde8e8; color: #c0392b; }
+        .s-idle { background: #eef0f4; color: #777; }
+
+        pre {
+            background: #1e2229; color: #d6e0ea; padding: 14px; border-radius: 6px;
+            overflow-x: auto; font-size: 13px; line-height: 1.6; margin: 8px 0 0;
+            font-family: Consolas, Monaco, monospace; white-space: pre-wrap; word-break: break-all;
+        }
+        .kv { font-size: 13px; color: #555; margin: 10px 0 0; }
+        .kv b { color: #222; }
+        .hint { font-size: 12px; color: #999; margin-top: 6px; }
+    </style>
+</head>
+<body>
+
+<h1>Agent API 调试台</h1>
+<div class="sub">用来手动调后端接口，不用记 curl 命令。接口地址固定为当前站点。</div>
+
+<!-- ============ 正常对话 ============ -->
+<div class="card">
+    <div class="row">
+        <label>sessionId（会话 ID，现在后端还不处理，先随便填）</label>
+        <input id="sessionId" value="test-1">
+    </div>
+    <div class="row">
+        <label>message（发给模型的内容）</label>
+        <textarea id="message">你好</textarea>
+    </div>
+    <div class="btns">
+        <button class="primary" id="btnSend">发送 POST /api/chat</button>
+        <button class="ghost" id="btnEmpty">测试空参数（应返回 400）</button>
+        <button class="ghost" id="btnHealth">检查 /actuator/health</button>
+    </div>
+
+    <div id="result" style="margin-top:18px">
+        <span class="status s-idle" id="statusBadge">尚未请求</span>
+        <div class="kv" id="meta"></div>
+        <pre id="output">点上面的按钮发请求，结果会显示在这里。</pre>
+    </div>
+</div>
+
+<!-- ============ 顺带看看配置 ============ -->
+<div class="card">
+    <div class="row">
+        <label>配置自检（不含密钥，只看有没有读到）</label>
+    </div>
+    <div class="btns">
+        <button class="ghost" id="btnConfig">GET /api/config-check</button>
+        <button class="ghost" id="btnPing">GET /api/ping</button>
+    </div>
+    <pre id="output2">—</pre>
+</div>
+
+<script>
+    const API_BASE = '';   // 同源，留空即可。如果前端部署在别处，改成 http://localhost:8080
+
+    const statusBadge = document.getElementById('statusBadge');
+    const meta        = document.getElementById('meta');
+    const output      = document.getElementById('output');
+    const output2     = document.getElementById('output2');
+
+    function setStatus(kind, text) {
+        statusBadge.className = 'status ' + kind;
+        statusBadge.textContent = text;
+    }
+
+    function disableAll(disabled) {
+        document.querySelectorAll('button').forEach(b => b.disabled = disabled);
+    }
+
+    /** 统一的请求入口：显示状态码、耗时、响应体 */
+    async function callApi(method, path, body, outEl) {
+        const target = outEl || output;
+        disableAll(true);
+        setStatus('s-idle', '请求中…');
+        meta.textContent = '';
+        target.textContent = '请求中…';
+
+        const started = performance.now();
+        try {
+            const options = { method, headers: {} };
+            if (body !== undefined) {
+                options.headers['Content-Type'] = 'application/json';
+                options.body = JSON.stringify(body);
+            }
+
+            const resp = await fetch(API_BASE + path, options);
+            const elapsed = Math.round(performance.now() - started);
+
+            // 尽量按 JSON 解析，失败就按文本
+            const raw = await resp.text();
+            let pretty = raw;
+            try { pretty = JSON.stringify(JSON.parse(raw), null, 2); } catch (e) {}
+
+            const okClass = resp.ok ? 's-ok' : (resp.status < 500 ? 's-warn' : 's-err');
+            setStatus(okClass, 'HTTP ' + resp.status);
+            meta.innerHTML = '<b>耗时</b> ' + elapsed + ' ms &nbsp;|&nbsp; <b>Content-Type</b> ' +
+                             (resp.headers.get('content-type') || '-');
+
+            target.textContent = pretty || '(空响应体)';
+        } catch (e) {
+            setStatus('s-err', '请求失败');
+            target.textContent = '网络或跨域错误：' + e.message +
+                '\n\n排查：\n① 后端起了吗？（访问 /api/ping 试试）\n② 控制台是否有 CORS 报错';
+        } finally {
+            disableAll(false);
+        }
+    }
+
+    // ---------- 按钮绑定 ----------
+
+    document.getElementById('btnSend').onclick = () => {
+        const sessionId = document.getElementById('sessionId').value.trim() || 'anonymous';
+        const message   = document.getElementById('message').value;
+        callApi('POST', '/api/chat', { sessionId, message });
+    };
+
+    document.getElementById('btnEmpty').onclick = () => {
+        callApi('POST', '/api/chat', { sessionId: 'test-1', message: '' });
+    };
+
+    document.getElementById('btnHealth').onclick = () => {
+        callApi('GET', '/actuator/health', undefined);
+    };
+
+    document.getElementById('btnConfig').onclick = () => {
+        callApi('GET', '/api/config-check', undefined, output2);
+    };
+
+    document.getElementById('btnPing').onclick = () => {
+        callApi('GET', '/api/ping', undefined, output2);
+    };
+</script>
+
+</body>
+</html>

@@ -49,6 +49,16 @@ public class DeepSeekClient implements LlmClient {
 
     @Override
     public ChatResponse chat(ChatRequest request) {
+        // ⚠️ 前置检查：key 没配就直接抛清楚，不要带着空 token 去请求上游。
+        // 否则上游返回 401 → 我们转成 503，排查时【分不清】是"key 没配"还是"key 配错了"。
+        // 这个检查让错误信息更精确（也顺便让"删除 key"这个测试场景可复现）。
+        if (!props.hasApiKey()) {
+            throw new LlmException(
+                    "API Key 未配置：请设置环境变量 DEEPSEEK_API_KEY，"
+                            + "或检查 application-local.yml 是否覆盖了 llm.api-key",
+                    401, false, null);
+        }
+
         long start = System.currentTimeMillis();
 
         log.debug("发起 LLM 调用: model={}, messages={}, stream={}",

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Agent Lab favicon：一个方框 + 内部循环箭头，象征"Agent 循环" -->
+  <rect width="32" height="32" rx="7" fill="#4a7dff"/>
+  <path d="M16 7.5 L23 15 L18.6 15 L18.6 24.5 L13.4 24.5 L13.4 15 L9 15 Z" fill="#ffffff"/>
+</svg>
