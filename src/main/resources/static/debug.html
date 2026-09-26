@@ -51,6 +51,21 @@
         .kv { font-size: 13px; color: #555; margin: 10px 0 0; }
         .kv b { color: #222; }
         .hint { font-size: 12px; color: #999; margin-top: 6px; }
+
+        /* 流式面板：光标闪烁 = "正在生成" */
+        .cursor {
+            display: inline-block; width: 8px; height: 15px; background: #4a7dff;
+            vertical-align: -2px; animation: blink .8s steps(1) infinite;
+        }
+        @keyframes blink { 50% { opacity: 0; } }
+        .chk { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #666; margin-top: 10px; }
+        .chk input { width: auto; }
+        #sseLog { margin-top: 12px; font-size: 12px; line-height: 1.8; color: #555;
+                  font-family: Consolas, Monaco, monospace; }
+        #sseLog div { border-top: 1px dashed #e8eaee; padding: 3px 0; }
+        #sseLog .t { color: #999; }
+        #sseLog .warn { color: #a86a00; }
+        #sseLog .err { color: #c0392b; }
     </style>
 </head>
 <body>
@@ -81,6 +96,39 @@
     </div>
 </div>
 
+<!-- ============ 流式对话（SSE）============ -->
+<div class="card">
+    <div class="row">
+        <label>sessionId（流式接口用它拼 URL 路径）</label>
+        <input id="sseSessionId" value="sse-1">
+    </div>
+    <div class="row">
+        <label>message（会作为 query 参数发出去）</label>
+        <textarea id="sseMessage">写一段 200 字左右的文字，介绍 SSE 是什么。要求一次性写完，不要问我问题。</textarea>
+    </div>
+    <div class="btns">
+        <button class="primary" id="btnSse">开始流式</button>
+        <button class="ghost" id="btnSseStop" disabled>中断连接（模拟 Ctrl+C）</button>
+    </div>
+    <div class="hint">
+        ⚠️ 浏览器原生 <b>EventSource 只支持 GET</b> —— 这就是流式接口用 GET + query 参数的原因，
+        而不是 POST + body。
+    </div>
+    <div class="chk">
+        <input type="checkbox" id="sseAllowReconnect">
+        <label for="sseAllowReconnect" style="margin:0;font-weight:400">
+            不自动 close，观察 EventSource 的自动重连行为（⚠️ 会重复调用模型、重复计费）
+        </label>
+    </div>
+
+    <div id="ssePanel" style="margin-top:18px">
+        <span class="status s-idle" id="sseStatus">尚未连接</span>
+        <div class="kv" id="sseMeta"></div>
+        <pre id="sseOutput"><span id="sseText"></span><span class="cursor" id="sseCursor" style="display:none"></span></pre>
+        <div id="sseLog"></div>
+    </div>
+</div>
+
 <!-- ============ 顺带看看配置 ============ -->
 <div class="card">
     <div class="row">
@@ -107,7 +155,12 @@
     }
 
     function disableAll(disabled) {
-        document.querySelectorAll('button').forEach(b => b.disabled = disabled);
+        document.querySelectorAll('button').forEach(b => {
+            // ⭐ 跳过流式那两个按钮：它们的状态由 sseFinish() 自己管，
+            //    被这里的批量开关覆盖会出现"流还在跑，中断按钮却是灰的"这种怪状态
+            if (b.id === 'btnSse' || b.id === 'btnSseStop') return;
+            b.disabled = disabled;
+        });
     }
 
     /** 统一的请求入口：显示状态码、耗时、响应体 */
@@ -171,6 +224,162 @@
 
     document.getElementById('btnPing').onclick = () => {
         callApi('GET', '/api/ping', undefined, output2);
+    };
+
+    // ============================================================
+    //  流式对话（SSE）—— 用浏览器【原生】的 EventSource
+    //
+    //  为什么用 EventSource 而不是 fetch：
+    //    EventSource 是浏览器内置的 SSE 客户端，自动帮你解析 "data:" 前缀和空行分隔，
+    //    你只管在 onmessage 里收数据。这就是 SSE 比 WebSocket"实现简单"的具体体现。
+    //
+    //  代价（下面代码里都标了）：
+    //    ① 只能 GET  → 这就是流式接口设计成 GET + query 参数的原因
+    //    ② 拿不到错误响应体
+    //    ③ 服务端一关连接，它就【自动重连】
+    // ============================================================
+
+    const sseStatus  = document.getElementById('sseStatus');
+    const sseMeta    = document.getElementById('sseMeta');
+    const sseText    = document.getElementById('sseText');
+    const sseCursor  = document.getElementById('sseCursor');
+    const sseLogEl   = document.getElementById('sseLog');
+    const btnSse     = document.getElementById('btnSse');
+    const btnSseStop = document.getElementById('btnSseStop');
+    const sseAllowReconnect = document.getElementById('sseAllowReconnect');
+
+    let es = null;      // 当前 EventSource
+    let t0 = 0;         // 发起时刻
+    let tFirst = 0;     // 首块到达时刻 ← 判断"真流式"的关键指标
+    let chunks = 0;     // 收到多少块
+    let conns = 0;      // 建立了几次连接（>1 说明发生了自动重连）
+    let text = '';      // 拼起来的完整回复
+
+    function sseLogLine(msg, cls) {
+        const sec = ((performance.now() - t0) / 1000).toFixed(2);
+        const div = document.createElement('div');
+        div.className = cls || '';
+        div.innerHTML = '<span class="t">[' + sec + 's]</span> ' + msg;
+        sseLogEl.appendChild(div);
+        sseLogEl.scrollTop = sseLogEl.scrollHeight;
+    }
+
+    function setSseStatus(kind, label) {
+        sseStatus.className = 'status ' + kind;
+        sseStatus.textContent = label;
+    }
+
+    function sseFinish(kind, label) {
+        if (es) { es.close(); es = null; }
+        sseCursor.style.display = 'none';
+        setSseStatus(kind, label);
+        btnSse.disabled = false;
+        btnSseStop.disabled = true;
+
+        const first = tFirst ? ((tFirst - t0) / 1000).toFixed(2) + ' s' : '-';
+        const total = ((performance.now() - t0) / 1000).toFixed(2) + ' s';
+        sseMeta.innerHTML =
+            '<b>首块</b> ' + first + ' &nbsp;|&nbsp; <b>总耗时</b> ' + total +
+            ' &nbsp;|&nbsp; <b>数据块</b> ' + chunks +
+            ' &nbsp;|&nbsp; <b>连接次数</b> ' + conns +
+            ' &nbsp;|&nbsp; <b>字符数</b> ' + text.length;
+
+        // ⭐ 这两个数字的【差距】就是"流式"的证据：
+        //    首块 1.2s / 总耗时 8.5s → 边生成边到（真流式）
+        //    首块 ≈ 总耗时            → 攒完一次性发（假流式）
+        if (tFirst) {
+            sseLogLine('首块比收完早了 ' + ((performance.now() - tFirst) / 1000).toFixed(2) +
+                       ' s —— 差值越大，越能证明是"边生成边推"', '');
+        }
+    }
+
+    function openStream(url) {
+        conns++;
+        if (conns > 1) {
+            sseLogLine('⚠️ 第 ' + conns + ' 次连接 —— 这是 EventSource 的【自动重连】，' +
+                       '不是服务端又推了一次。每重连一次就多调一次模型、多烧一次 token，' +
+                       '文字也会被再拼一遍。', 'warn');
+        }
+
+        es = new EventSource(url);
+
+        es.onopen = () => {
+            if (conns === 1) {
+                sseLogLine('连接已建立（onopen）');
+                setSseStatus('s-ok', '接收中…');
+            } else {
+                sseLogLine('自动重连成功（onopen）', 'warn');
+                setSseStatus('s-warn', '重连后接收中…');
+            }
+        };
+
+        es.onmessage = (e) => {
+            chunks++;
+            if (!tFirst) {
+                tFirst = performance.now();
+                sseLogLine('首块到达');
+            }
+            text += e.data;
+            // ⭐ 打字机效果就是这一行：每来一块就刷新一次文本
+            sseText.textContent = text;
+        };
+
+        es.onerror = () => {
+            // ⚠️ onerror 的三个坑全在这儿：
+            //   ① 服务端【正常发完就关连接】也会触发 onerror —— 对 EventSource 来说"被关闭"就是"错误"，
+            //      它并不区分"正常结束"和"网络断了"（除非服务端发个约定的终止事件，见课时 9）
+            //   ② readyState=CONNECTING 表示它【正准备重连】，=CLOSED 表示真的没了
+            //   ③ 拿不到响应体：像 400 / 503 这种，EventSource 只给你一个 error 事件，
+            //      看不到 {"code":"INVALID_REQUEST",...}，排查得去看浏览器 Network 面板
+            const state = es ? es.readyState : -1;
+
+            // 勾了"观察自动重连"就故意不 close，让浏览器重连给你看
+            if (sseAllowReconnect.checked && state !== EventSource.CLOSED) {
+                sseLogLine('服务端关闭了连接 —— EventSource 准备在约 3 秒后【自动重连】。' +
+                           '已收到 ' + chunks + ' 块。', 'warn');
+                setSseStatus('s-warn', '等待自动重连…');
+                return;
+            }
+
+            if (state === EventSource.CONNECTING) {
+                sseLogLine('服务端发完就关闭了连接。浏览器本来会 3 秒后自动重连（=再调一次模型），' +
+                           '这里已经帮你 close() 掉了。', 'warn');
+                sseLogLine('👉 想根治：服务端得在结束时发一个约定的终止事件，让客户端知道"可以关了"（课时 9）', '');
+                sseFinish('s-ok', '已完成（' + chunks + ' 块）');
+            } else {
+                sseLogLine('连接失败或已断开。若是 400/503，EventSource 拿不到响应体，请看 Network 面板。', 'err');
+                sseFinish('s-err', '连接失败');
+            }
+        };
+    }
+
+    btnSse.onclick = () => {
+        const sessionId = document.getElementById('sseSessionId').value.trim() || 'anonymous';
+        const message   = document.getElementById('sseMessage').value;
+        if (!message.trim()) { alert('message 不能为空'); return; }
+
+        // 重置面板
+        text = ''; chunks = 0; conns = 0; tFirst = 0;
+        sseText.textContent = '';
+        sseMeta.textContent = '';
+        sseLogEl.innerHTML = '';
+        t0 = performance.now();
+
+        btnSse.disabled = true;
+        btnSseStop.disabled = false;
+        sseCursor.style.display = 'inline-block';
+        setSseStatus('s-idle', '连接中…');
+
+        // ⚠️ 必须 encodeURIComponent：中文、空格直接拼进 URL 会 400
+        const url = '/api/chat/stream/' + encodeURIComponent(sessionId) +
+                    '?message=' + encodeURIComponent(message);
+        sseLogLine('GET ' + url);
+        openStream(url);
+    };
+
+    btnSseStop.onclick = () => {
+        sseLogLine('手动中断：es.close() —— 现在去看 IDEA 控制台，看服务端能不能感知到这次断开', 'warn');
+        sseFinish('s-warn', '已手动中断');
     };
 </script>
 
