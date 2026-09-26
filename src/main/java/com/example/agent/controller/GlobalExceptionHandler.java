@@ -6,6 +6,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
@@ -141,5 +143,50 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(new ApiErrorResponse("INTERNAL_ERROR", "服务器内部错误", false));
+    }
+
+    /**
+     * 缺少必填的请求参数 —— 例如流式接口没带 {@code message}。
+     *
+     * <p>⭐ 为什么必须是 <b>400</b>：这是<b>客户端</b>的错，它自己能改（把参数补上）。
+     * 返回 500 等于告诉客户端"你没错，是服务器坏了" —— 客户端会去重试，而重试永远不会成功。
+     *
+     * <p>⚠️ 不要让它落到 {@code Exception.class} 兜底：
+     * 兜底 handler 越宽泛，越容易把"该 4xx"的转成 500。每发现一种这种情况就补一个专门 handler。
+     *
+     * <p>参数名可以安全地告诉客户端（它不是内部信息），这样用户一眼就知道少了什么。
+     */
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    public ResponseEntity<ApiErrorResponse> handleMissingParam(MissingServletRequestParameterException e) {
+        // warn 而非 error：是【客户端】的调用姿势不对，不是服务端故障，不该惊动运维
+        log.warn("请求缺少必填参数: {}", e.getParameterName());
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                // 参数名是客户端自己的东西，告诉它才能改；不像内部类名那样需要藏
+                .body(ApiErrorResponse.invalidRequest("缺少必填参数: " + e.getParameterName()));
+    }
+
+    /**
+     * 请求体解析失败 —— 不是合法 JSON，或者压根没有 body。
+     *
+     * <p>同样返回 <b>400</b>（客户端的错）。
+     *
+     * <p>⚠️⚠️ 但这里的 {@code message} 处理和上面<b>不一样</b>：
+     * {@code e.getMessage()} 里包含<b>原始 JSON 片段 + Jackson 解析器的内部信息</b>
+     * （实测长这样：{@code JSON parse error: Unexpected character ('n' (code 110))...
+     * at [Source: REDACTED; byte offset: #1]}）。
+     * 直接回显给客户端 = <b>信息泄露 + 用户看不懂的噪音</b>。
+     * → JSON 里回一句固定人话，完整原因只进日志。
+     *
+     * <p>日志也建议 {@code log.warn} 且<b>不要打整个堆栈</b> —— 否则又是刷屏。
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ApiErrorResponse> handleNotReadable(HttpMessageNotReadableException e) {
+        // 只记 e.getMessage()，不记堆栈：参数错误是噪音，打堆栈会刷屏（对比下面兜底那个 log.error(...,e)）
+        log.warn("请求体解析失败: {}", e.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                // ⚠️ 固定人话，【不回显】e.getMessage() —— 那里面带着 Jackson 解析器的内部细节
+                .body(ApiErrorResponse.invalidRequest("请求体不是合法的 JSON"));
     }
 }

@@ -5,8 +5,11 @@ import com.example.agent.dto.api.ApiErrorResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpInputMessage;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -171,6 +174,80 @@ class GlobalExceptionHandlerTest {
             assertThat(resp.getBody().retryable())
                     .as("参数错误重试无意义")
                     .isFalse();
+        }
+    }
+
+    // ===============================================================
+    //  ⭐ 框架抛的参数异常 —— 也必须自己接住，否则会掉进兜底变 500
+    //  实测背景见 agent-notes.md §13.3：两种都曾返回 500
+    // ===============================================================
+
+    @Nested
+    @DisplayName("缺少必填请求参数（MissingServletRequestParameterException）")
+    class MissingParam {
+
+        // ⚠️ Spring 7 的构造器是 (String 参数名, String 类型名) ——
+        //    老版本是 (String, Class<?>)，网上 Spring Boot 3.x 的示例在这里编不过
+        private final MissingServletRequestParameterException ex =
+                new MissingServletRequestParameterException("message", "String");
+
+        @Test
+        @DisplayName("返回 400 而不是 500 —— 兜底 Exception.class 不该接住它")
+        void shouldReturn400Not500() {
+            ResponseEntity<ApiErrorResponse> resp = handler.handleMissingParam(ex);
+
+            assertThat(resp.getStatusCode())
+                    .as("缺参数是客户端的错，返回 500 会让客户端以为重试有用")
+                    .isEqualTo(HttpStatus.BAD_REQUEST);
+            assertThat(resp.getBody().code()).isEqualTo(ApiErrorResponse.INVALID_REQUEST);
+            assertThat(resp.getBody().retryable()).isFalse();
+        }
+
+        @Test
+        @DisplayName("message 里要带参数名 —— 客户端才知道该补什么")
+        void shouldTellWhichParameter() {
+            ResponseEntity<ApiErrorResponse> resp = handler.handleMissingParam(ex);
+
+            assertThat(resp.getBody().message()).contains("message");
+        }
+    }
+
+    @Nested
+    @DisplayName("请求体不是合法 JSON（HttpMessageNotReadableException）")
+    class NotReadable {
+
+        /**
+         * 模拟真实异常：里面带着 Jackson 解析器的内部信息。
+         *
+         * <p>⚠️ Spring 7 没有单参数的构造器了，至少要给一个 {@code HttpInputMessage}
+         * （实测场景里它本来就为 null —— 请求体没读成，自然没有输入流）。
+         */
+        private final HttpMessageNotReadableException ex = new HttpMessageNotReadableException(
+                "JSON parse error: Unexpected character ('n' (code 110)): was expecting double-quote "
+                        + "to start property name at [Source: REDACTED; byte offset: #1]",
+                (HttpInputMessage) null);
+
+        @Test
+        @DisplayName("返回 400")
+        void shouldReturn400() {
+            ResponseEntity<ApiErrorResponse> resp = handler.handleNotReadable(ex);
+
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+            assertThat(resp.getBody().code()).isEqualTo(ApiErrorResponse.INVALID_REQUEST);
+            assertThat(resp.getBody().retryable()).isFalse();
+        }
+
+        @Test
+        @DisplayName("⭐ 不能把解析器内部细节回显给客户端 —— 它只该进日志")
+        void shouldNotLeakParserDetail() {
+            ResponseEntity<ApiErrorResponse> resp = handler.handleNotReadable(ex);
+
+            assertThat(resp.getBody().message())
+                    .as("解析器错误含字节偏移、内部类名等实现细节，属于信息泄露")
+                    .doesNotContain("code 110")
+                    .doesNotContain("REDACTED")
+                    .doesNotContain("byte offset")
+                    .doesNotContain("JSON parse error");
         }
     }
 
