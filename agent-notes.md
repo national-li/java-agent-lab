@@ -21,6 +21,7 @@
 - [§10 Plan-and-Execute 与选型判据](#10-plan-and-execute-与选型判据)
 - [§11 PostgreSQL / pgvector 速览](#11-postgresql--pgvector-速览)
 - [§12 速查命令](#12-速查命令)
+- [§13 课时 8 实测记录（SSE 流式）](#13-课时-8-实测记录sse-流式)
 
 ---
 
@@ -1732,3 +1733,282 @@ git grep -n -I --untracked -E "sk-[a-zA-Z0-9]{20,}"   # 应为空
 curl.exe -i https://docker.m.daocloud.io/v2/
 # HTTP 401 = ✅ 活着（要求认证，正常）；超时/拒绝 = ❌ 挂了
 ```
+
+---
+
+## §13 课时 8 实测记录（SSE 流式）
+
+> 实测日期 2026-09-26。**课时 8 两项验收均通过**，但顺带测出 3 个"该 400 却返回 500"一类的问题。
+> 记录在此，作为课时 9（流式容错）和课时 37（统一异常处理）的起点。
+
+### 13.1 验收结果：✅ 通过
+
+| 验收项 | 命令 | 结果 |
+|---|---|---|
+| **逐字输出** | `curl.exe -N "http://localhost:8081/api/chat/stream/x?message=..."` | ✅ `HTTP 200`，`Content-Type: text/event-stream` |
+| **`[DONE]` 后正常关闭** | 同上，看服务端日志 | ✅ 日志 `流式调用完成` + `流式请求结束`，无异常 |
+| 渐进式到达（非攒完再发） | 逐行打时间戳的客户端 | ✅ 响应头 946ms → 首块 956ms → 末块 1708ms，共 292 行 |
+
+**实测的 SSE 原文**（这就是"逐字"的样子）：
+
+```
+data:Spring
+
+data: arrives
+
+data: as
+
+data: a
+
+...
+```
+
+⚠️ **注意格式是 `data:xxx`（冒号后没有空格）** —— Spring 的 SSE 编码器不补空格。
+**这是合法的**（SSE 规范里冒号后的空格是可选的、且两端都要忽略），浏览器 `EventSource` 正常工作。
+**不是 bug**，不要为了"好看"去手拼字符串。
+
+服务端日志（usage 也拿到了）：
+
+```
+c.e.a.controller.ChatController - 收到流式请求: sessionId=lesson8-2, messageLength=47
+c.e.a.client.DeepSeekClient    - 流式调用完成: 耗时=1682ms, totalTokens=161,
+                                 promptTokens=15, completionTokens=146
+c.e.a.controller.ChatController - 流式请求结束: sessionId=lesson8-2
+```
+
+### 13.2 ⭐ 课时 8 的三个坑：你实际上绕过了两个
+
+| 坑（plan.md 列的） | 你的实现 | 是否踩到 |
+|---|---|---|
+| ① `delta.content` 是 `null` → NPE | `StreamChunk.hasContent()` 统一判 `null` + `isBlank()`，Controller 用 `filter()` 过滤 | ✅ 绕过 |
+| ② 一个 chunk 可能含多行 `data:` → 要按行切分 | 用 `ServerSentEvent<String>` 让 **Spring 的 SSE 解码器**负责拆帧 | ✅ **绕过（这是关键设计）** |
+| ③ 转发时手拼 `data: xxx\n\n` | 返回 `Flux<ServerSentEvent<String>>` + `produces = TEXT_EVENT_STREAM_VALUE` | ✅ 绕过 |
+
+> ⭐ **坑 ② 和 ③ 之所以没踩到，是因为一开始就没手写字节流。**
+> `bodyToFlux(ServerSentEvent<String>)` 让框架做协议解析、你只处理**语义**（`delta.content`）——
+> 手写 `split("\n")` 才是那个坑的来源。**"别自己解析协议"是这一课最值钱的经验。**
+
+### 13.3 ⚠️ 测出 3 个问题（都不影响课时 8 验收，但都是真问题）
+
+#### 问题 A：少了 `message` 参数 → 返回 **500**（应该是 400）
+
+```powershell
+curl.exe -s -w "`nHTTP=%{http_code}`n" "http://localhost:8081/api/chat/stream/x"   # 不带 message
+# 实际: {"code":"INTERNAL_ERROR","message":"服务器内部错误","retryable":false}  HTTP=500
+# 期望: 400 INVALID_REQUEST
+```
+
+**根因**：`@RequestParam String message` 缺参时，Spring 抛 `MissingServletRequestParameterException`，
+**被 `GlobalExceptionHandler` 的 `Exception.class` 兜底接住了 → 500**。
+
+> 这和坑「`NoResourceFoundException` 被兜底成 500」是**同一类问题的第二个实例**：
+> **兜底 handler 越宽泛，越容易把该 4xx 的转成 500。**
+
+#### 问题 B：请求体不是合法 JSON / 没有 body → 也返回 **500**（应该是 400）
+
+```powershell
+curl.exe -s -X POST "http://localhost:8081/api/chat" -H "Content-Type: application/json" -d "{not json"
+# 500 INTERNAL_ERROR（且堆栈以 ERROR 级别刷屏）
+```
+
+**根因**：`HttpMessageNotReadableException` 同样落进 `Exception.class` 兜底。
+
+**需要补的 handler**：
+
+| 异常 | 该返回 | 状态 |
+|---|---|---|
+| `MissingServletRequestParameterException` | 400 | ✅ 已补（见下） |
+| `HttpMessageNotReadableException` | 400 | ✅ 已补（见下） |
+| `MethodArgumentTypeMismatchException` | 400 | ⬜ **暂时补不了** —— 当前所有参数都是 `String`，构造不出类型不匹配。等 W6/W7 有 `int pageSize` 这类参数时再补 |
+| `AsyncRequestNotUsableException` | 不返回，只把日志降级 | ⬜ 课时 9 |
+
+#### ✅ 已修复（2026-09-26 实测通过）
+
+补了两个 handler 后，4 条 curl **全部返回 400**：
+
+```
+缺 message 参数   → 400 {"code":"INVALID_REQUEST","message":"缺少必填参数: message","retryable":false}
+message 是空白    → 400 {"code":"INVALID_REQUEST","message":"message 不能为空","retryable":false}
+请求体非法 JSON   → 400 {"code":"INVALID_REQUEST","message":"请求体不是合法的 JSON","retryable":false}
+完全没有 body     → 400 {"code":"INVALID_REQUEST","message":"请求体不是合法的 JSON","retryable":false}
+```
+
+日志也干净了（**每个 WARN 一行，没有堆栈**）：
+
+```
+WARN c.e.a.c.GlobalExceptionHandler - 请求缺少必填参数: message
+WARN c.e.a.c.GlobalExceptionHandler - 请求体解析失败: JSON parse error: Unexpected character ('n' (code 110)): ...
+WARN c.e.a.c.GlobalExceptionHandler - 请求体解析失败: Required request body is missing: public com.example...ChatController.chat(...)
+```
+
+**三个关键设计点**：
+
+| 点 | 为什么 |
+|---|---|
+| 两个 handler 的 message 处理**必须不同** | 缺参数 → `e.getParameterName()` **可以**回显（那是客户端自己的参数名，它才知道该补什么）<br>坏 JSON → `e.getMessage()` **不能**回显（含 Jackson 解析器内部信息：字节偏移、`code 110`）→ 回固定人话，原始原因只进日志 |
+| 日志用 `warn` 不是 `error` | 这是**客户端**的调用姿势不对，不是服务端故障，不该惊动运维 |
+| 日志只记 `e.getMessage()`，**不把异常对象传进去** | `log.warn("...", e)` 会打整个堆栈 → 参数错误把日志刷满（对比兜底那个 `log.error("未预期的异常", e)`） |
+
+**回归**：单元测试 **13/13 通过**（新增 4 个），流式接口仍正常（`200` + `text/event-stream` + 内容正确）。
+
+#### 问题 C：客户端中途断开 → **两条 ERROR 堆栈，且异常处理器自己失败** ⭐ 课时 9 的直接起点
+
+用 `curl --max-time 1` 模拟 Ctrl+C（实测确实断开，收到 1074 字节后断开），服务端日志出现：
+
+```
+ERROR GlobalExceptionHandler - 未预期的异常
+org.springframework.web.context.request.async.AsyncRequestNotUsableException:
+    ServletResponse failed to flushBuffer: java.io.IOException: Connection reset by peer
+  Caused by: org.apache.catalina.connector.ClientAbortException
+
+WARN  ExceptionHandlerExceptionResolver - Failure in @ExceptionHandler handleUnknown(Exception)
+org.springframework.http.converter.HttpMessageNotWritableException:
+    No converter for [class ApiErrorResponse] with preset Content-Type 'text/event-stream'
+```
+
+**两个问题**：
+
+1. **日志误导**：客户端断开是**正常事件**，却打了两条 ERROR 堆栈 —— 看起来像服务端崩了。
+   正确做法：识别 `AsyncRequestNotUsableException` / `ClientAbortException`，降级成 INFO/DEBUG。
+2. **异常处理器对 SSE 端点根本用不了**：响应头已经以 `text/event-stream` 发出去了，
+   `@RestControllerAdvice` 想返回 `ApiErrorResponse` JSON → **没有转换器能写** → 二次异常。
+
+> ⭐ **这就是课时 9 "流中途出错怎么办" 的答案雏形**：
+> ```
+> 首字节【之前】出错 → HTTP 状态码还没发 → 还能返回正常 JSON（实测：无效 key 返回 503 ✅）
+> 首字节【之后】出错 → 状态码已提交 → 只能推一个 event: error 再关连接
+> ```
+> **实测证据（无效 key 场景）**：`HTTP=503` + `{"code":"SERVICE_MISCONFIGURED", ...}`
+> —— 说明 `chatStream()` 里的**前置检查放在返回 Flux 之前**是对的，错误能在提交响应前抛出。
+
+**课时 9 待办**（现在还没有的东西）：
+- [ ] `doOnCancel` / `doFinally` 明确记录"检测到客户端断开"（现在断开时 `doOnComplete` **不会**触发，日志里什么都看不到）
+- [ ] 验证断开后**上游 DeepSeek 请求是否真的被取消**（否则白烧 token —— 这是课时 9 的验收核心）
+- [ ] 断开 & 中途异常改成 `event: error` 推送
+
+### 13.4 小坑：pom 里那个 `jackson-core:2.22.2` 是多余依赖
+
+```xml
+<dependency>                              <!-- 为了 mapError() 里的 -->
+  <groupId>com.fasterxml.jackson.core</groupId>   <!-- com.fasterxml.jackson.core.JsonProcessingException -->
+  <artifactId>jackson-core</artifactId>           <!-- 才加进来的 -->
+  <version>2.22.2</version>
+</dependency>
+```
+
+**实测 fat jar 里同时存在两个 jackson-core**：
+
+```
+BOOT-INF/lib/jackson-core-3.1.5.jar     ← Spring Boot 4 用的（Jackson 3）
+BOOT-INF/lib/jackson-core-2.22.2.jar    ← 手动加的（Jackson 2）
+```
+
+**问题**：`DeepSeekClient.mapError()` 里那个分支
+
+```java
+if (e instanceof JsonProcessingException) { ... }   // ← 永远不成立
+```
+
+**Jackson 3 抛的是 `tools.jackson.core.JacksonException`**（注意包名是 `tools.jackson`，不是 `com.fasterxml.jackson`），
+所以这个 `instanceof` **是死代码** —— 而且该分支本意是标记"可重试"，实际会落到最后的兜底分支被标成"不可重试"。
+
+**建议**（不紧急）：删掉 pom 里这个依赖，把分支改成 `tools.jackson.core.JacksonException`，顺手核对一遍**重试分类**（课时 10 正好要干这个）。
+
+> 📌 **顺带记住**：**Jackson 3 的包名变了**（`tools.jackson.*`），
+> 网上 Spring Boot 3.x 的示例写的 `com.fasterxml.jackson.databind.ObjectMapper` **在这里是不存在的**。
+> 只有**注解**还在 `com.fasterxml.jackson.annotation`（所以 DTO 上的 `@JsonIgnoreProperties` 是对的）。
+
+### 13.5 给这两个 handler 写单元测试时，踩到两个 Spring 7 API 差异
+
+补 handler 时顺手加了 4 个单测（`GlobalExceptionHandlerTest`），**编译不过两次**，都是 Spring 7 删掉了旧重载：
+
+| 写法（网上 SB 3.x 示例的写法） | Spring 7 的实际情况 |
+|---|---|
+| `new MissingServletRequestParameterException("message", String.class)` | ❌ 编译错误：第二参数已从 `Class<?>` 改成 **`String`**（类型名）<br>✅ `new MissingServletRequestParameterException("message", "String")` |
+| `new HttpMessageNotReadableException("...")` | ❌ 编译错误：**单参数构造器没了**<br>✅ 至少要给 `HttpInputMessage`：`new HttpMessageNotReadableException(msg, (HttpInputMessage) null)` |
+
+> ⚠️ **规律**：Spring 7 把"已废弃的重载"直接删了，**不是留着给你调**。
+> 遇到"找不到合适的构造器"，第一反应应该是**去查 Spring 7 的 Javadoc**，而不是怀疑自己写错。
+> 更省事的办法：**测试里别自己 new 精确的构造参数** —— 用 `assertThrows` 那套不如直接构造，但构造参数一定要对着当前版本的 API 抄。
+
+**另一个测试环境的坑**：`.\mvnw.cmd package` **必须带着 `DEEPSEEK_API_KEY` 跑**，否则
+`AgentApplicationTests`（上下文加载测试）会因为 `llm.api-key` 为空触发 `@NotBlank` **fail-fast** 而失败：
+
+```
+Could not bind properties to 'LlmProperties' : prefix=llm
+```
+
+```powershell
+# 正确姿势（把用户级环境变量喂给 Maven 那个进程）
+$env:DEEPSEEK_API_KEY = [Environment]::GetEnvironmentVariable("DEEPSEEK_API_KEY","User")
+.\mvnw.cmd package
+```
+
+> 这不是 bug —— **是 §13.3 之外的设计**：key 缺失就该启动失败（fail-fast），
+> 否则会带着空 token 去请求上游，然后在 401 里绕半天。
+> 只是要知道：**Maven 子进程不会自动继承你 IDEA 里配的环境变量**，命令行跑测试得自己喂。
+
+### 13.6 ⭐⭐ 实测发现：浏览器 `EventSource` 会**自动重连** → 模型被重复调用（真金白银）
+
+> 给 `debug.html` 加 SSE 面板时顺手验证的。**这是课时 8 里最有价值的一个发现** ——
+> 它只在"真的接上浏览器"时才暴露，光用 curl 测永远看不到。
+
+**实测方式**：用 Node 24 内置的**真实 `EventSource`**（与浏览器同一套行为）
+
+```powershell
+node --experimental-eventsource target\sse_probe.js "http://localhost:8081/api/chat/stream/sse-probe?message=hi" 13
+```
+
+**结果：13 秒内建立了 4 次连接**
+
+```
+ 1.4s 🟢 onopen  —— 第 1 次连接建立
+ 1.5s 🔴 onerror readyState=0 → CONNECTING（正准备自动重连）
+ 5.4s 🟢 onopen  —— 第 2 次连接建立
+ 5.5s 🔴 onerror readyState=0 → CONNECTING
+ 9.1s 🟢 onopen  —— 第 3 次连接建立
+ 9.1s 🔴 onerror readyState=0 → CONNECTING
+12.6s 🟢 onopen  —— 第 4 次连接建立
+```
+
+**服务端日志同步证实 —— 4 次真实模型调用**：
+
+```
+14:25:15 收到流式请求: sessionId=sse-probe → 流式调用完成: totalTokens=15
+14:25:20 收到流式请求: sessionId=sse-probe → 流式调用完成: totalTokens=14
+14:25:24 收到流式请求: sessionId=sse-probe → 流式调用完成: totalTokens=15
+14:25:27 收到流式请求: sessionId=sse-probe → 流式调用完成: totalTokens=14
+```
+
+> 问一次 `hi`，**被计费 4 次**（共 58 tokens）。而且各次收到的文本并不完全一样
+> （`"Hithere!"` / `"Hi!"`），说明**不是缓存重放，是真的又问了一遍模型**。
+
+**根因**：`EventSource` 的设计目标就是**断线自愈** —— 连接一断就自动重连（默认约 3 秒）。
+而我们的服务端**发完流直接关连接**，且**不发任何终止事件**，于是客户端
+**无法区分"正常结束"和"网络断了"**，只能按规范重连。
+
+重连时 URL 里的 query 参数一模一样 → 又跑一次完整流程 → **又调一次大模型**。
+
+> ⚠️ **这不是小问题**：真实前端上线后，用户问一句、页面开着不动，模型就被无限重复调用。
+> 用 curl 测永远发现不了，因为 curl 不会重连。
+
+**两种解法**：
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **① 服务端发终止事件** ⭐ 推荐 | 结束时推一个约定事件（如 `event: done`），客户端收到就 `es.close()` | 客户端必须配合实现；写漏了还是会重连 |
+| **② 前端不用 `EventSource`** | 改用 `fetch` + `ReadableStream` | 得自己解析 `data:` 前缀和空行 —— **等于重新踩 plan.md 的坑 ②③**；好处是能用 POST、能拿到错误响应体 |
+
+⭐ **这个坑属于课时 9**：课时 9 的"流式收尾"不只是"把回复落库"，
+还包括**告诉客户端"可以关了"**。这也是 SSE 协议层面必须自己补的一环。
+
+**调试台的行为**（`debug.html` 新增的 SSE 面板）：
+默认收到关闭就自动 `close()`（**避免你手滑烧钱**）；
+想亲眼看这个现象，勾上"观察自动重连"再开始流式。
+
+**面板上另外两个能学到东西的地方**：
+
+| 现象 | 说明 |
+|---|---|
+| **首块 vs 总耗时** | 面板会显示这两个数字和**差值**。差值大 = 真流式（边生成边推）；两者接近 = 假流式（攒完一次性发）。这是验收"逐字输出"最直接的量化指标 |
+| **`onerror` 的语义坑** | 服务端**正常发完关连接也会触发 `onerror`** —— 对 `EventSource` 来说"被关闭"就等于"错误"。而且 **400/503 时它拿不到响应体**（看不到 `{"code":"INVALID_REQUEST"}`），排查只能看浏览器 Network 面板。这是 `EventSource` 相对 `fetch` 的硬伤 |
