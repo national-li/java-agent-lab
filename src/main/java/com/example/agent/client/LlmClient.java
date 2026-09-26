@@ -2,6 +2,8 @@ package com.example.agent.client;
 
 import com.example.agent.dto.ChatRequest;
 import com.example.agent.dto.ChatResponse;
+import com.example.agent.dto.StreamChunk;
+import reactor.core.publisher.Flux;
 
 /**
  * LLM 客户端抽象。
@@ -22,4 +24,7 @@ public interface LlmClient {
      * @throws LlmException LLM 调用失败（网络、认证、限流等）
      */
     ChatResponse chat(ChatRequest request);
+
+    /** 流式调用。返回的 Flux 每发一个元素就是一个内容片段 */
+    Flux<StreamChunk> chatStream(ChatRequest request);
 }
